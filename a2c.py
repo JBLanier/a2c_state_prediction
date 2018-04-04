@@ -125,9 +125,13 @@ def main():
             new_observation, reward, done, _ = env.step(action_choice)
             new_observation = np.expand_dims(new_observation, axis=0)
 
+            # add shaped reward for losing before time limit end simulation
+            if done and t != 499:
+                reward = -100
+
             agent.train(observation, value, action_choice, reward, new_observation, done)
 
-            if i_episode > 400:
+            if i_episode >= 700:
                 # let A2C agent gain some experience first
                 td_loss = state_predictor.train(current_observation=observation, next_observation=new_observation)
                 if i_episode % 100 == 0 and t % 100 == 0:
