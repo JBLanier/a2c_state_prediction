@@ -4,6 +4,9 @@ from keras.models import Model, Sequential
 from keras import backend as K
 import keras
 import numpy as np
+from envs.subproc_vec_env import SubprocVecEnv
+from lr_decay import LearningRateDecay
+import tensorflow as tf
 
 
 class TDStatePredictor:
@@ -49,19 +52,19 @@ class A2CAgent:
 
         self.policy_entropy_regularization_factor = 0.01
         self.value_loss_coefficient = 1
-        self.discount_factor = 0.99
 
         observations = Input(shape=self.observation_space_shape, dtype='float32', name='observations')
         h1 = Dense(units=40, activation=keras.activations.relu, name='fc1')(observations)
-        h2 = Dense(units=40, activation=keras.activations.relu, name='fc2')(h1)
+        h2 = Dense(units=80, activation=keras.activations.relu, name='fc2')(h1)
+        h3 = Dense(units=40, activation=keras.activations.relu, name='fc3')(h2)
 
         policy_probabilities_outputs = Dense(units=self.num_actions,
                                              activation=keras.activations.softmax,
-                                             name='policy_output')(h2)
+                                             name='policy_output')(h3)
 
         values_outputs = Dense(units=1,
                                activation=None,
-                               name='value_output')(h2)
+                               name='value_output')(h3)
 
         self.model = Model(inputs=observations, outputs=[policy_probabilities_outputs, values_outputs])
 
@@ -77,77 +80,140 @@ class A2CAgent:
 
         total_loss = policy_gradient_loss - self.policy_entropy_regularization_factor * policy_entropy + value_loss * self.value_loss_coefficient
 
-        optimizer = keras.optimizers.adam(lr=0.001)
-        updates = optimizer.get_updates(loss=total_loss, params=self.model.trainable_weights)
+        # self.optimizer = keras.optimizers.adam(lr=0.001)
+        # updates = self.optimizer.get_updates(loss=total_loss, params=self.model.trainable_weights)
+
+        params = self.model.trainable_weights
+
+        grads = tf.gradients(total_loss, params)
+        # max_grad_norm = 0.5
+        # if max_grad_norm is not None:
+        #     grads, grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
+        grads = list(zip(grads, params))
+
+        trainer = tf.train.AdamOptimizer(learning_rate=0.001)
+        _train = trainer.apply_gradients(grads)
 
         self.train_fn = K.function(
             inputs=[advantages, value_targets, observations],
             outputs=[policy_probabilities_outputs, values_outputs,
                      policy_gradient_loss, policy_entropy, value_loss, total_loss],
-            updates=updates
+            updates=[_train]
         )
 
     def step(self, observation):
         action_probs, predicted_value = self.model.predict_on_batch(x={'observations': observation})
         return action_probs, predicted_value
 
-    def train(self, observation, value, action, reward, next_observation, done):
-        _, new_value = self.model.predict_on_batch(x={'observations': next_observation})
-
-        if done:
-            value_target = reward
-        else:
-            value_target = reward + (self.discount_factor * new_value)
-
-        advantage = np.zeros((1, self.num_actions))
-        advantage[0, action] = value_target - value
-
-        self.train_fn([advantage, value_target, observation])
+    def train(self, observations, values, actions, discounted_rewards):
+        advantages = np.zeros((values.shape[0], self.num_actions))
+        for i, (action, value, discounted_reward) in enumerate(zip(actions, values, discounted_rewards)):
+            advantages[i, action] = discounted_reward - value
+        # K.set_value(self.optimizer.lr, lr)
+        self.train_fn([advantages, discounted_rewards, observations])
 
 
-def main():
-    # TODO: Implement multiple simultaneous environments and multi-step returns for A2C
 
-    env = gym.make('CartPole-v1')
-    agent = A2CAgent(observation_space_shape=env.observation_space.shape, num_actions=env.action_space.n)
-    state_predictor = TDStatePredictor(observation_space_shape=env.observation_space.shape, sequence_length=5)
+class Trainer:
 
-    for i_episode in range(20000):
-        observation = env.reset()
-        observation = np.expand_dims(observation, axis=0)
+    def __init__(self):
+        self.env_id = "CartPole-v1"
+        self.num_env = 12
+        self.seed = 42
+        self.n_steps = 5
+        self.num_iterations = 1000000
+        self.discount_factor = 0.99
+        self.dones = [False for _ in range(self.num_env)]
+        # self.lr_decay = LearningRateDecay(v=0.0001, nvalues=self.num_iterations*self.num_env*self.n_steps, lr_decay_method='linear')
 
-        for t in range(1000):
-            # env.render()
+        def make_env(rank):
+            def _thunk():
+                env = gym.make(self.env_id)
+                env.seed(self.seed + rank)
+                # env = Monitor(env, logger.get_dir() and os.path.join(logger.get_dir(), str(rank)))
+                return env
+            return _thunk
 
-            action_probabilities, value = agent.step(observation)
-            action_choice = np.random.choice(env.action_space.n, p=action_probabilities[0])
+        self.env = SubprocVecEnv([make_env(i) for i in range(self.num_env)])
+        self.observations = self.env.reset()
 
-            new_observation, reward, done, _ = env.step(action_choice)
-            new_observation = np.expand_dims(new_observation, axis=0)
+        self.train_observation_shape = (self.num_env * self.n_steps,) + self.env.observation_space.shape
 
-            # add shaped reward for losing before time limit end simulation
-            if done and t != 499:
-                reward = -100
+        self.agent = A2CAgent(observation_space_shape=self.env.observation_space.shape, num_actions=self.env.action_space.n)
+        # self.state_predictor = TDStatePredictor(observation_space_shape=env.observation_space.shape, sequence_length=5)
 
-            agent.train(observation, value, action_choice, reward, new_observation, done)
+        for iteration in range(self.num_iterations):
 
-            if i_episode >= 700:
-                # let A2C agent gain some experience first
-                td_loss = state_predictor.train(current_observation=observation, next_observation=new_observation)
-                if i_episode % 100 == 0 and t % 100 == 0:
-                    print("state prediction loss: {}".format(td_loss))
+            mb_observations, mb_discounted_rewards, mb_actions, mb_values = self.__run_steps()
+            # print("mb_observations: {}".format(mb_observations))
+            # print("mb_rewards: {}".format(mb_discounted_rewards))
+            # print("mb_actions: {}".format(mb_actions))
+            # print("mb_values: {}".format(mb_values))
+
+            self.agent.train(mb_observations, mb_values, mb_actions, mb_discounted_rewards)
 
 
-            observation = new_observation
-            if done:
-                print("Episode {} finished after {} timesteps".format(i_episode, t + 1))
-                # if t + 1 == 500:
-                #     print("Completed Cart Pole Task! ({} Episodes)".format(i_episode))
-                break
+    def __run_steps(self):
 
-    print("Done")
-    env.close()
+        mb_observations, mb_rewards, mb_actions, mb_values, mb_dones = [], [], [], [], []
 
+        for n in range(self.n_steps):
+            # self.env.render()
+
+            action_probabilities, values = self.agent.step(self.observations)
+
+            actions = []
+            for p in action_probabilities:
+                actions.append(np.random.choice(self.env.action_space.n, p=p))
+
+            mb_observations.append(self.observations)
+            mb_actions.append(actions)
+            mb_values.append(values)
+            mb_dones.append(self.dones)
+
+            new_observations, rewards, dones, _ = self.env.step(actions)
+
+            mb_rewards.append(rewards)
+
+            self.dones = dones
+            self.observations = new_observations
+        mb_dones.append(self.dones)
+
+        # Conversion from (time_steps, num_envs) to (num_envs, time_steps)
+        # print("As array: {}".format(np.asarray(mb_observations, dtype=np.float32)))
+        mb_obs = np.asarray(mb_observations, dtype=np.float32).swapaxes(1, 0).reshape(self.train_observation_shape)
+        mb_rewards = np.asarray(mb_rewards, dtype=np.float32).swapaxes(1, 0)
+        mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(1, 0)
+        mb_values = np.asarray(mb_values, dtype=np.float32).swapaxes(1, 0)
+        mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(1, 0)
+        mb_dones = mb_dones[:, 1:]
+        _, last_values = self.agent.step(self.observations)
+
+        # Discount/bootstrap off value fn in all parallel environments
+        for n, (rewards, dones, value) in enumerate(zip(mb_rewards, mb_dones, last_values)):
+            rewards = rewards.tolist()
+            dones = dones.tolist()
+            if dones[-1] == 0:
+                rewards = self.__discount_with_dones(rewards + [value], dones + [0], self.discount_factor)[:-1]
+            else:
+                rewards = self.__discount_with_dones(rewards, dones, self.discount_factor)
+            mb_rewards[n] = rewards
+
+        # Instead of (num_envs, time_steps). Make them num_envs*time_steps.
+        mb_rewards = mb_rewards.flatten()
+        mb_actions = mb_actions.flatten()
+        mb_values = mb_values.flatten()
+        return mb_obs, mb_rewards, mb_actions, mb_values
+
+    @staticmethod
+    def __discount_with_dones(rewards, dones, gamma):
+        discounted = []
+        r = 0
+        # Start from downwards to upwards like Bellman backup operation.
+        for reward, done in zip(rewards[::-1], dones[::-1]):
+            r = reward + gamma * r * (1. - done)  # fixed off by one bug
+            discounted.append(r)
+        return discounted[::-1]
 
 if __name__ == '__main__':
-    main()
+    trainer = Trainer()
