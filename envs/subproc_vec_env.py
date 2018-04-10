@@ -31,7 +31,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
             if done:
                 if step_counter != 500:
                     reward = -10
-                print("Done after {} steps".format(step_counter))
+                # print("Done after {} steps".format(step_counter))
                 step_counter = 0
                 ob = env.reset()
             remote.send((ob, reward, done, total_info))

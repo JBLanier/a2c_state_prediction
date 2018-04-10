@@ -9,39 +9,43 @@ from lr_decay import LearningRateDecay
 import tensorflow as tf
 
 
-class TDStatePredictor:
-    def __init__(self, observation_space_shape, sequence_length):
-        batch_size = 1  # equals number of simultaneous environments?
-
+class StatePredictor:
+    def __init__(self, observation_space_shape, num_actions):
         model = Sequential()
 
-        model.add(LSTM(32, return_sequences=True, stateful=False,
-                       batch_input_shape=(batch_size, sequence_length,) + observation_space_shape))
-        model.add(LSTM(32, return_sequences=True, stateful=False))
-        model.add(TimeDistributed(Dense(20, activation='relu', kernel_initializer='he_normal')))
-        model.add(TimeDistributed(Dense(observation_space_shape[0], activation='linear')))
+        print("input shape: {}".format((observation_space_shape[0] + num_actions,)))
 
-        model.compile(loss='mse', optimizer='rmsprop')
+        model.add(Dense(input_shape=(observation_space_shape[0] + num_actions,), units=80, activation='relu', kernel_initializer='he_normal'))
+        model.add(Dense(40, activation='relu', kernel_initializer='he_normal'))
+        model.add(Dense(20, activation='relu', kernel_initializer='he_normal'))
+        model.add(Dense(observation_space_shape[0] + 1, activation='linear', kernel_initializer='he_normal'))
+
+        model.compile(loss='mse', optimizer='adam')
 
         self.model = model
-        self.sequence_length = sequence_length
         self.observation_space_shape = observation_space_shape
+        self.num_actions = num_actions
 
-    def _repeat_inputs(self, observations):
-        observations = np.expand_dims(observations, axis=1)
-        return np.repeat(observations, repeats=self.sequence_length, axis=1)
+    def _format_inputs(self, current_observations, actions):
+        actions_one_hot = np.zeros((actions.shape[0], self.num_actions))
+        for i, action in enumerate(actions):
+            actions_one_hot[i, action] = 1
+        return np.column_stack((current_observations, actions_one_hot))
 
-    def predict_future_observations(self, current_observation):
-        # - this is one to many -
+    def predict(self, current_observations, actions):
+        return self.model.predict_on_batch(self._format_inputs(current_observations, actions))
 
-        # input for every time step of rnn is the initial observation repeated
-        return self.model.predict_on_batch(self._repeat_inputs(current_observation))
+    def train(self, current_observations, actions, rewards, next_observations):
 
-    def train(self, current_observation, next_observation):
-        y_target = self.predict_future_observations(next_observation)[:, :-1, :]
-        y_target = np.insert(y_target, 0, next_observation, axis=1)
-
-        return self.model.train_on_batch(x=self._repeat_inputs(current_observation), y=y_target)
+        inputs = self._format_inputs(current_observations, actions)
+        targets = np.column_stack((next_observations, rewards))
+        # print("c_obs: {}".format(current_observations))
+        # print("actions: {}".format(actions))
+        # print("rewards: {}".format(rewards))
+        # print("next_observations: {}".format(next_observations))
+        # print("inputs: {}".format(inputs))
+        # print("targets: {}".format(targets))
+        return self.model.train_on_batch(x=inputs, y=targets)
 
 
 class A2CAgent:
@@ -118,9 +122,9 @@ class Trainer:
 
     def __init__(self):
         self.env_id = "CartPole-v1"
-        self.num_env = 12
+        self.num_env = 2
         self.seed = 42
-        self.n_steps = 5
+        self.n_steps = 3
         self.num_iterations = 1000000
         self.discount_factor = 0.99
         self.dones = [False for _ in range(self.num_env)]
@@ -140,18 +144,21 @@ class Trainer:
         self.train_observation_shape = (self.num_env * self.n_steps,) + self.env.observation_space.shape
 
         self.agent = A2CAgent(observation_space_shape=self.env.observation_space.shape, num_actions=self.env.action_space.n)
-        # self.state_predictor = TDStatePredictor(observation_space_shape=env.observation_space.shape, sequence_length=5)
+        self.state_predictor = StatePredictor(observation_space_shape=self.env.observation_space.shape, num_actions=self.env.action_space.n)
 
         for iteration in range(self.num_iterations):
 
-            mb_observations, mb_discounted_rewards, mb_actions, mb_values = self.__run_steps()
+            mb_observations, mb_discounted_rewards, mb_actions, mb_values, mb_next_obs, mb_rewards = self.__run_steps()
             # print("mb_observations: {}".format(mb_observations))
-            # print("mb_rewards: {}".format(mb_discounted_rewards))
+            # print("mb_discounted_rewards: {}".format(mb_discounted_rewards))
             # print("mb_actions: {}".format(mb_actions))
             # print("mb_values: {}".format(mb_values))
 
             self.agent.train(mb_observations, mb_values, mb_actions, mb_discounted_rewards)
 
+            loss = self.state_predictor.train(mb_observations, mb_actions, mb_rewards, mb_next_obs)
+            if iteration % 50 == 0:
+                print("state pred loss: {}".format(loss))
 
     def __run_steps(self):
 
@@ -178,11 +185,15 @@ class Trainer:
             self.dones = dones
             self.observations = new_observations
         mb_dones.append(self.dones)
-
+        mb_observations.append(self.observations)
         # Conversion from (time_steps, num_envs) to (num_envs, time_steps)
         # print("As array: {}".format(np.asarray(mb_observations, dtype=np.float32)))
-        mb_obs = np.asarray(mb_observations, dtype=np.float32).swapaxes(1, 0).reshape(self.train_observation_shape)
+        mb_next_obs = np.asarray(mb_observations[1:], dtype=np.float32).swapaxes(1, 0).reshape(self.train_observation_shape)
+
+
+        mb_obs = np.asarray(mb_observations[:-1], dtype=np.float32).swapaxes(1, 0).reshape(self.train_observation_shape)
         mb_rewards = np.asarray(mb_rewards, dtype=np.float32).swapaxes(1, 0)
+        mb_discounted_rewards = np.zeros(mb_rewards.shape, dtype=np.float32)
         mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(1, 0)
         mb_values = np.asarray(mb_values, dtype=np.float32).swapaxes(1, 0)
         mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(1, 0)
@@ -197,13 +208,14 @@ class Trainer:
                 rewards = self.__discount_with_dones(rewards + [value], dones + [0], self.discount_factor)[:-1]
             else:
                 rewards = self.__discount_with_dones(rewards, dones, self.discount_factor)
-            mb_rewards[n] = rewards
+            mb_discounted_rewards[n] = rewards
 
         # Instead of (num_envs, time_steps). Make them num_envs*time_steps.
+        mb_discounted_rewards = mb_discounted_rewards.flatten()
         mb_rewards = mb_rewards.flatten()
         mb_actions = mb_actions.flatten()
         mb_values = mb_values.flatten()
-        return mb_obs, mb_rewards, mb_actions, mb_values
+        return mb_obs, mb_discounted_rewards, mb_actions, mb_values, mb_next_obs, mb_rewards
 
     @staticmethod
     def __discount_with_dones(rewards, dones, gamma):
